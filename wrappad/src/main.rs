@@ -199,14 +199,6 @@ async fn handle_client(stream: UnixStream) -> anyhow::Result<()> {
     if req.needs_setgroups { "allow" } else { "deny" },
   );
 
-  println!(
-    "wrote idmaps for child={}: uid={}→0 gid={}→0 setgroups={}",
-    req.child,
-    req.requested_uid,
-    req.requested_gid,
-    if req.needs_setgroups { "allow" } else { "deny" },
-  );
-
   connection::send_answer(&mut write_half, WrappaResponse::Ok).await?;
 
   Ok(())
