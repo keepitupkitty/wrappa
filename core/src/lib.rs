@@ -15,7 +15,10 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-use anyhow::anyhow;
+use {
+  anyhow::{Context, anyhow},
+  nix::sys::utsname::uname
+};
 
 pub mod auth;
 pub mod connection;
@@ -32,31 +35,14 @@ const REQUIRED_KERNEL_MAJOR: u32 = 6;
 const REQUIRED_KERNEL_MINOR: u32 = 13;
 
 pub fn require_kernel_version() -> anyhow::Result<()> {
-  let version_str = std::fs::read_to_string("/proc/version")
-    .map_err(|e| anyhow!("read /proc/version: {}", e))?;
-
-  let kernel_version = version_str
-    .split_whitespace()
-    .nth(2)
-    .ok_or_else(|| anyhow!("malformed /proc/version: {:?}", version_str))?;
-
-  let mut parts = kernel_version.splitn(3, '.');
+  let uts = uname().context("Failed to call uname")?;
+  let version =
+    uts.release().to_str().context("Malformed kerrnel version string")?;
+  let kver = version.splitn(2, '.');
   let major: u32 =
-    parts.next().and_then(|s| s.parse().ok()).ok_or_else(|| {
-      anyhow!("cannot parse kernel major from {:?}", kernel_version)
-    })?;
-  let minor: u32 = parts
-    .next()
-    .and_then(|s| {
-      s.chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .parse()
-        .ok()
-    })
-    .ok_or_else(|| {
-      anyhow!("cannot parse kernel minor from {:?}", kernel_version)
-    })?;
+    kver.clone().next().context("Cannot get major kernel version")?.parse()?;
+  let minor: u32 =
+    kver.clone().next().context("Cannot get minor kernel version")?.parse()?;
 
   if (major, minor) < (REQUIRED_KERNEL_MAJOR, REQUIRED_KERNEL_MINOR) {
     return Err(anyhow!(
