@@ -70,7 +70,7 @@ fn main() -> anyhow::Result<()> {
   let uid = args.uid.unwrap_or(getuid().into());
 
   let mut fds = [0i32; 2];
-  if unsafe { libc::pipe(fds.as_mut_ptr()) == -1 } {
+  if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) == -1 } {
     return Err(anyhow!(
       "Cannot crate a pipe: {}",
       std::io::Error::last_os_error()
@@ -221,6 +221,8 @@ fn main() -> anyhow::Result<()> {
       Some(Signal::SIGCHLD as i32)
     )?
   };
+
+  unsafe { libc::close(fds[0]) };
 
   let request = connection::WrappaRequest {
     child: child_pid.as_raw(),
