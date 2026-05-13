@@ -65,6 +65,5 @@ pub fn is_allowed_cap(cap: Capability) -> bool {
 pub fn is_allowed_cap_su(cap: Capability) -> bool {
   matches!(cap, |Capability::CAP_SETUID| Capability::CAP_SETGID |
     Capability::CAP_DAC_READ_SEARCH |
-    Capability::CAP_DAC_OVERRIDE |
     Capability::CAP_SETPCAP)
 }
