@@ -67,16 +67,26 @@ pub fn write_idmaps(
   let setgroups_val = if needs_setgroups { "allow" } else { "deny" };
   write_proc(child, "setgroups", setgroups_val).context("setgroups")?;
 
-  let uid_map = format!("0 0 1\n{uid} {uid} 1\n");
+  let uid_map = if uid == 0 {
+    "0 0 1\n".to_string()
+  } else {
+    format!("0 0 1\n{uid} {uid} 1\n")
+  };
   write_proc(child, "uid_map", &uid_map).context("uid_map")?;
 
   verify_map_written(child, "uid_map", &uid_map)
     .context("uid_map readback verification")?;
 
   let mut seen = std::collections::HashSet::new();
-  let mut gid_map = format!("0 0 1\n{gid} {gid} 1\n");
+  seen.insert(0);
+  let mut gid_map = if gid == 0 {
+    "0 0 1\n".to_string()
+  } else {
+    seen.insert(gid);
+    format!("0 0 1\n{gid} {gid} 1\n")
+  };
   for &sgid in supplementary_gids {
-    if sgid == gid || !seen.insert(sgid) {
+    if !seen.insert(sgid) {
       continue;
     }
     gid_map.push_str(&format!("{sgid} {sgid} 1\n"));

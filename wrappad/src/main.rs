@@ -112,10 +112,19 @@ async fn handle_client(stream: UnixStream) -> anyhow::Result<()> {
       std::io::Error::last_os_error()
     ));
   }
+  let peer_pidfd: wrappa_core::Pid = unsafe { pidfd_open(peer_pid, 0) };
+  if peer_pidfd == -1 {
+    return Err(anyhow!(
+      "Cannot obtain pidfd for {}: {}",
+      peer_pid,
+      std::io::Error::last_os_error()
+    ));
+  }
 
   if let Err(e) = auth::validate_child_ownership(
     child_pidfd,
     req.child,
+    peer_pidfd,
     peer_pid,
     peer_uid,
     peer_gid,

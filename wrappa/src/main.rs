@@ -13,7 +13,7 @@ use {
   },
   std::{
     ffi::CStr,
-    os::{raw::c_void, unix::net::UnixStream},
+    os::{fd::AsRawFd, raw::c_void, unix::net::UnixStream},
     process::exit
   },
   wrappa_core::{
@@ -133,6 +133,8 @@ fn main() -> anyhow::Result<()> {
       eprintln!("Access denied");
       exit(127);
     }
+
+    unsafe { libc::close(stream.as_raw_fd()) };
 
     if setgroups {
       if caps::has_cap(None, CapSet::Effective, Capability::CAP_SETPCAP)

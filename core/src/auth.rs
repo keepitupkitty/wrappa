@@ -34,6 +34,7 @@ nix::ioctl_readwrite!(pidfd_get_info, 0xFF, 11, PidFDInfo);
 pub fn validate_child_ownership(
   child_pidfd: Pid,
   child_pid: Pid,
+  peer_pidfd: Pid,
   peer_pid: Pid,
   peer_uid: Uid,
   peer_gid: Gid,
@@ -45,6 +46,24 @@ pub fn validate_child_ownership(
     pidfd_get_info(child_pidfd, &mut info).with_context(|| {
       format!("Cannot get file descriptor information for pid {}", child_pid)
     })?;
+  }
+
+  let mut peer_info: PidFDInfo = Default::default();
+  unsafe {
+    pidfd_get_info(peer_pidfd, &mut peer_info).with_context(|| {
+      format!("Cannot get file descriptor information for pid {}", peer_pid)
+    })?;
+  }
+
+  if peer_info.euid != peer_uid || peer_info.egid != peer_gid {
+    return Err(anyhow!(
+      "peer PID {} euid={} egid={} (SO_PEERCRED says euid={} egid={})",
+      peer_pid,
+      peer_info.euid,
+      peer_info.egid,
+      peer_uid,
+      peer_gid
+    ));
   }
 
   if info.ppid == 0 {
