@@ -17,7 +17,7 @@ pub struct WrappaRequest {
   pub needs_setgroups: bool
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "status")]
 pub enum WrappaResponse {
   Ok,

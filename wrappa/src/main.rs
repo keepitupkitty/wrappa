@@ -1,5 +1,6 @@
 use {
   anyhow::{Context, anyhow},
+  caps::{CapSet, Capability},
   clap::Parser,
   nix::{
     sched::{CloneFlags, clone},
@@ -8,13 +9,18 @@ use {
       signal::{Signal, kill},
       wait::{WaitStatus, waitpid}
     },
-    unistd::{getgid, getuid, pipe}
+    unistd::{execve, getgid, getuid, pipe}
   },
   std::{
+    ffi::CStr,
     os::{fd::OwnedFd, unix::net::UnixStream},
     process::exit
   },
-  wrappa_core::{WRAPPA_SOCKET, connection}
+  wrappa_core::{
+    WRAPPA_SOCKET,
+    auth,
+    connection::{self, WrappaResponse}
+  }
 };
 
 #[derive(Parser, Debug)]
@@ -79,17 +85,104 @@ fn main() -> anyhow::Result<()> {
 
   let child_callback: Box<dyn FnMut() -> isize> = Box::new(|| {
     drop(write_fd.try_clone());
+
     let mut buf = [0u8; 1];
     let _ = nix::unistd::read(&read_fd, &mut buf);
     drop(read_fd.try_clone());
 
-    // TODO: mounts, caps and exec
-    println!("We are in the child!!!");
-    println!("cmds: {:#?}", argv0_args);
-    let status = std::process::Command::new("zsh")
-      .status()
-      .expect("Failed to execute command");
-    status.code().unwrap_or(-1) as isize
+    // Need filesystem and PID namespace
+    // TODO: mount /dev as tmpfs and bind only needed stuff RIGHT HERE
+    // mount /bin /lib /libexec /sbin /usr /opt with nosuid and rdonly
+    // (shall be checked if such path exists + if /bin /sbin /lib /libexec are
+    // links then dont mount case for merged /usr)
+    // mount /sys, /tmp as tmpfs
+    // mount /proc
+
+    let all_caps = caps::all();
+    let wanted: Vec<Capability> = match auth::parse_caps(&caps) {
+      | Ok(result) => result,
+      | Err(e) => {
+        eprintln!("Cannot parse capability: {e}");
+        exit(127);
+      }
+    };
+
+    for cap in &all_caps {
+      if !wanted.contains(cap) {
+        let _ = caps::drop(None, CapSet::Permitted, *cap);
+      }
+    }
+
+    let response = match connection::receive_request_result(&mut stream) {
+      | Ok(result) => result,
+      | Err(e) => {
+        eprintln!("Cannot get response: {e}");
+        exit(127);
+      }
+    };
+
+    if response != WrappaResponse::Ok {
+      eprintln!("Access denied");
+      exit(127);
+    }
+
+    for cap in &all_caps {
+      if wanted.contains(cap) {
+        let _ = caps::raise(None, CapSet::Effective, *cap);
+        let _ = caps::raise(None, CapSet::Inheritable, *cap);
+      } else {
+        let _ = caps::drop(None, CapSet::Effective, *cap);
+        let _ = caps::drop(None, CapSet::Inheritable, *cap);
+      }
+    }
+
+    for cap in &wanted {
+      if let Err(e) = caps::raise(None, CapSet::Ambient, *cap) {
+        eprintln!("ambient raise {:?} failed: {}", cap, e);
+        exit(127);
+      }
+    }
+
+    if caps::has_cap(None, CapSet::Effective, Capability::CAP_SETPCAP)
+      .unwrap_or(false)
+    {
+      let securebits: libc::c_int = libc::SECBIT_NOROOT |
+        libc::SECBIT_NOROOT_LOCKED |
+        libc::SECBIT_NO_SETUID_FIXUP |
+        libc::SECBIT_NO_SETUID_FIXUP_LOCKED;
+
+      let ret =
+        unsafe { libc::prctl(libc::PR_SET_SECUREBITS, securebits, 0, 0, 0) };
+      if ret != 0 {
+        eprintln!(
+          "wrappa: warning: PR_SET_SECUREBITS failed: {}",
+          std::io::Error::last_os_error()
+        );
+        exit(127);
+      }
+    }
+
+    let path = wrappa_core::strtocstr(&argv0);
+    let mut args: Vec<&'static CStr> = Vec::new();
+    for a in argv0_args {
+      let cstr = wrappa_core::strtocstr(&a).as_ptr();
+      unsafe { args.push(CStr::from_ptr(cstr)) };
+    }
+
+    let env: &[&'static CStr] = &[
+      c"HOME=/tmp",
+      c"PATH=/bin:/sbin:/usr/bin:/usr/sbin",
+      c"LC_ALL=C.UTF-8",
+      c"LC_MESSAGES=ru_RU.UTF-8"
+    ];
+
+    match execve(&path, args.as_slice(), env) {
+      | Ok(_) => return 0,
+      | Err(e) => {
+        eprintln!("Cannot run executable \"{argv0}\": {e}");
+        exit(127);
+      }
+    }
   });
 
   let clone_flags = CloneFlags::CLONE_NEWUSER;

@@ -17,7 +17,11 @@
 
 use {
   anyhow::{Context, anyhow},
-  nix::sys::utsname::uname
+  nix::sys::utsname::uname,
+  std::{
+    borrow::Cow,
+    ffi::{CStr, CString}
+  }
 };
 
 pub mod auth;
@@ -56,4 +60,11 @@ pub fn require_kernel_version() -> anyhow::Result<()> {
   }
 
   Ok(())
+}
+
+#[inline]
+pub fn strtocstr(s: &str) -> Cow<'static, CStr> {
+  let bytes: Vec<u8> = s.bytes().take_while(|&b| b != 0).collect();
+
+  unsafe { Cow::Owned(CString::from_vec_unchecked(bytes)) }
 }
