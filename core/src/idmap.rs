@@ -68,13 +68,13 @@ pub fn write_idmaps(
   let setgroups_val = if needs_setgroups { "allow" } else { "deny" };
   write_proc(child, "setgroups", setgroups_val).context("setgroups")?;
 
-  let uid_map = format!("0 {} 1\n", uid);
+  let uid_map = format!("0 {} 1\n{} 10000 1\n", uid, uid);
   write_proc(child, "uid_map", &uid_map).context("uid_map")?;
 
   verify_map_written(child, "uid_map", &uid_map)
     .context("uid_map readback verification")?;
 
-  let gid_map = format!("0 {} 1\n", gid);
+  let gid_map = format!("0 {} 1\n{} 10000 1\n", gid, gid);
   write_proc(child, "gid_map", &gid_map).context("gid_map")?;
 
   verify_map_written(child, "gid_map", &gid_map)

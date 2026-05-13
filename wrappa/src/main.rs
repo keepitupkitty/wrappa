@@ -174,6 +174,17 @@ fn main() -> anyhow::Result<()> {
       }
     }
 
+    if setgroups {
+      if nix::unistd::setgid(gid.into()).is_err() {
+        eprintln!("Cannot set group ID: {}", std::io::Error::last_os_error());
+        exit(127);
+      }
+      if nix::unistd::setuid(uid.into()).is_err() {
+        eprintln!("Cannot set user ID: {}", std::io::Error::last_os_error());
+        exit(127);
+      }
+    }
+
     let path = wrappa_core::strtocstr(&argv0);
     let mut args: Vec<&'static CStr> = Vec::new();
     for a in argv0_args {
@@ -185,7 +196,8 @@ fn main() -> anyhow::Result<()> {
       c"HOME=/tmp",
       c"PATH=/bin:/sbin:/usr/bin:/usr/sbin",
       c"LC_ALL=C.UTF-8",
-      c"LC_MESSAGES=ru_RU.UTF-8"
+      c"LC_MESSAGES=ru_RU.UTF-8",
+      c"TERM=linux"
     ];
 
     match execve(&path, args.as_slice(), env) {
@@ -215,8 +227,6 @@ fn main() -> anyhow::Result<()> {
     requested_capabilities: caps,
     needs_setgroups: setgroups
   };
-
-  //drop(read_fd);
 
   if let Err(e) = connection::send_request(&mut stream, &request) {
     unsafe { libc::close(fds[1]) };
