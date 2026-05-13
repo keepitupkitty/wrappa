@@ -140,8 +140,10 @@ fn main() -> anyhow::Result<()> {
       if caps::has_cap(None, CapSet::Effective, Capability::CAP_SETPCAP)
         .unwrap_or(false)
       {
-        let securebits: libc::c_int =
-          libc::SECBIT_KEEP_CAPS | libc::SECBIT_KEEP_CAPS_LOCKED;
+        let securebits: libc::c_int = libc::SECBIT_KEEP_CAPS |
+          libc::SECBIT_KEEP_CAPS_LOCKED |
+          libc::SECBIT_NOROOT |
+          libc::SECBIT_NOROOT_LOCKED;
         let ret =
           unsafe { libc::prctl(libc::PR_SET_SECUREBITS, securebits, 0, 0, 0) };
         if ret != 0 {
