@@ -1,6 +1,5 @@
 use {
   anyhow::{Context, anyhow},
-  caps::{CapSet, Capability},
   clap::Parser,
   nix::{
     sched::{CloneFlags, clone},
@@ -9,7 +8,7 @@ use {
       signal::{Signal, kill},
       wait::{WaitStatus, waitpid}
     },
-    unistd::{execve, getgid, getuid}
+    unistd::{chdir, execve, getgid, getgroups, getuid, setgid, setuid}
   },
   std::{
     ffi::CStr,
@@ -86,11 +85,17 @@ fn main() -> anyhow::Result<()> {
 
   let mut stack: Vec<u8> = vec![0u8; stack_size];
 
+  let orig_groups: Vec<libc::uid_t> = getgroups()
+    .context("getgroups failed")?
+    .into_iter()
+    .map(|g| g.as_raw())
+    .collect();
+
+  let groups = orig_groups.clone();
+
   let child_callback: Box<dyn FnMut() -> isize> = Box::new(|| {
     unsafe { libc::close(fds[1]) };
-
     let mut ch: u8 = 0;
-
     if unsafe { libc::read(fds[0], &mut ch as *mut u8 as *mut c_void, 1) != 0 }
     {
       eprintln!(
@@ -99,17 +104,9 @@ fn main() -> anyhow::Result<()> {
       );
       exit(127);
     }
-
     unsafe { libc::close(fds[0]) };
 
-    // Need filesystem and PID namespace
-    // TODO: mount /dev as tmpfs and bind only needed stuff RIGHT HERE
-    // mount /bin /lib /libexec /sbin /usr /opt with nosuid and rdonly
-    // (shall be checked if such path exists + if /bin /sbin /lib /libexec are
-    // links then dont mount case for merged /usr)
-    // mount /sys, /tmp as tmpfs
-    // mount /proc
-
+    use caps::{CapSet, Capability};
     let all_caps = caps::all();
     let wanted: Vec<Capability> = match auth::parse_caps(&caps) {
       | Ok(result) => result,
@@ -132,76 +129,78 @@ fn main() -> anyhow::Result<()> {
         exit(127);
       }
     };
-
     if response != WrappaResponse::Ok {
       eprintln!("Access denied");
       exit(127);
     }
 
-    for cap in &all_caps {
-      if wanted.contains(cap) {
-        let _ = caps::raise(None, CapSet::Effective, *cap);
-        let _ = caps::raise(None, CapSet::Inheritable, *cap);
-      } else {
-        let _ = caps::drop(None, CapSet::Effective, *cap);
-        let _ = caps::drop(None, CapSet::Inheritable, *cap);
-      }
-    }
-
-    for cap in &wanted {
-      if let Err(e) = caps::raise(None, CapSet::Ambient, *cap) {
-        eprintln!("ambient raise {:?} failed: {}", cap, e);
-        exit(127);
-      }
-    }
-
-    if caps::has_cap(None, CapSet::Effective, Capability::CAP_SETPCAP)
-      .unwrap_or(false)
-    {
-      let securebits: libc::c_int = libc::SECBIT_NOROOT |
-        libc::SECBIT_NOROOT_LOCKED |
-        libc::SECBIT_NO_SETUID_FIXUP |
-        libc::SECBIT_NO_SETUID_FIXUP_LOCKED;
-
-      let ret =
-        unsafe { libc::prctl(libc::PR_SET_SECUREBITS, securebits, 0, 0, 0) };
-      if ret != 0 {
-        eprintln!(
-          "PR_SET_SECUREBITS failed: {}",
-          std::io::Error::last_os_error()
-        );
-        exit(127);
-      }
-    }
-
     if setgroups {
-      if nix::unistd::setgid(gid.into()).is_err() {
-        eprintln!("Cannot set group ID: {}", std::io::Error::last_os_error());
+      if caps::has_cap(None, CapSet::Effective, Capability::CAP_SETPCAP)
+        .unwrap_or(false)
+      {
+        let securebits: libc::c_int =
+          libc::SECBIT_KEEP_CAPS | libc::SECBIT_KEEP_CAPS_LOCKED;
+        let ret =
+          unsafe { libc::prctl(libc::PR_SET_SECUREBITS, securebits, 0, 0, 0) };
+        if ret != 0 {
+          eprintln!(
+            "PR_SET_SECUREBITS failed: {}",
+            std::io::Error::last_os_error()
+          );
+          exit(127);
+        }
+      }
+
+      let gid_objs: Vec<nix::unistd::Gid> =
+        groups.iter().map(|&g| nix::unistd::Gid::from_raw(g)).collect();
+      if let Err(e) = nix::unistd::setgroups(&gid_objs) {
+        eprintln!("setgroups failed: {e}");
         exit(127);
       }
-      if nix::unistd::setuid(uid.into()).is_err() {
-        eprintln!("Cannot set user ID: {}", std::io::Error::last_os_error());
+      if let Err(e) = setgid(gid.into()) {
+        eprintln!("setgid failed: {e}");
         exit(127);
       }
+      if let Err(e) = setuid(uid.into()) {
+        eprintln!("setuid failed: {e}");
+        exit(127);
+      }
+
+      for cap in &all_caps {
+        if wanted.contains(cap) {
+          let _ = caps::raise(None, CapSet::Effective, *cap);
+          let _ = caps::raise(None, CapSet::Inheritable, *cap);
+        } else {
+          let _ = caps::drop(None, CapSet::Effective, *cap);
+          let _ = caps::drop(None, CapSet::Inheritable, *cap);
+        }
+      }
+
+      for cap in &wanted {
+        if let Err(e) = caps::raise(None, CapSet::Ambient, *cap) {
+          eprintln!("ambient raise {:?} failed: {}", cap, e);
+          exit(127);
+        }
+      }
+    }
+
+    if let Err(e) = chdir("/tmp") {
+      eprintln!("chdir failed: {e}");
+      exit(127);
     }
 
     let path = wrappa_core::strtocstr(&argv0);
-    let mut args: Vec<&'static CStr> = Vec::new();
+    let path = path.into_owned();
+    let mut owned_args: Vec<std::ffi::CString> = Vec::new();
+    owned_args.push(path.clone());
     for a in argv0_args {
-      let cstr = wrappa_core::strtocstr(&a).as_ptr();
-      unsafe { args.push(CStr::from_ptr(cstr)) };
+      owned_args.push(wrappa_core::strtocstr(a).into_owned());
     }
-
-    let env: &[&'static CStr] = &[
-      c"HOME=/tmp",
-      c"PATH=/bin:/sbin:/usr/bin:/usr/sbin",
-      c"LC_ALL=C.UTF-8",
-      c"LC_MESSAGES=ru_RU.UTF-8",
-      c"TERM=linux"
-    ];
+    let args: Vec<&CStr> = owned_args.iter().map(|s| s.as_c_str()).collect();
+    let env: &[&'static CStr] = &[c"HOME=/tmp", c"TERM=linux"];
 
     match execve(&path, args.as_slice(), env) {
-      | Ok(_) => return 0,
+      | Ok(_) => 0,
       | Err(e) => {
         eprintln!("Cannot run executable \"{argv0}\": {e}");
         exit(127);
@@ -209,7 +208,10 @@ fn main() -> anyhow::Result<()> {
     }
   });
 
-  let clone_flags = CloneFlags::CLONE_NEWUSER;
+  let clone_flags = CloneFlags::CLONE_NEWUSER |
+    CloneFlags::CLONE_NEWNS |
+    CloneFlags::CLONE_NEWPID |
+    CloneFlags::CLONE_NEWUTS;
 
   let child_pid = unsafe {
     clone(

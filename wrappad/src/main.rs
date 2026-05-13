@@ -186,7 +186,7 @@ async fn handle_client(stream: UnixStream) -> anyhow::Result<()> {
   let setgroups = req.needs_setgroups;
 
   tokio::task::spawn_blocking(move || {
-    idmap::write_idmaps(child, req_uid, req_gid, setgroups)
+    idmap::write_idmaps(child, req_uid, req_gid, &peer_groups, setgroups)
   })
   .await
   .context("spawn_blocking idmaps")??;

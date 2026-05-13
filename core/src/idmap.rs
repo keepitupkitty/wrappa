@@ -25,8 +25,6 @@ fn verify_map_written(
   let actual =
     fs::read_to_string(&path).with_context(|| format!("readback {}", path))?;
 
-  // The kernel may add trailing whitespace or normalise spacing.
-  // Compare field by field: inner_uid outer_uid count
   let parse_map = |s: &str| -> Option<(u64, u64, u64)> {
     let mut parts = s.split_whitespace();
     let a = parts.next()?.parse().ok()?;
@@ -63,18 +61,29 @@ pub fn write_idmaps(
   child: super::Pid,
   uid: super::Uid,
   gid: super::Gid,
+  supplementary_gids: &[super::Gid],
   needs_setgroups: bool
 ) -> anyhow::Result<()> {
   let setgroups_val = if needs_setgroups { "allow" } else { "deny" };
   write_proc(child, "setgroups", setgroups_val).context("setgroups")?;
 
-  let uid_map = format!("0 {} 1\n{} 10000 1\n", uid, uid);
+  let uid_map = format!("0 0 1\n{uid} {uid} 1\n");
   write_proc(child, "uid_map", &uid_map).context("uid_map")?;
 
   verify_map_written(child, "uid_map", &uid_map)
     .context("uid_map readback verification")?;
 
-  let gid_map = format!("0 {} 1\n{} 10000 1\n", gid, gid);
+  println!("sup {:#?}", supplementary_gids);
+
+  let mut seen = std::collections::HashSet::new();
+  let mut gid_map = format!("0 0 1\n{gid} {gid} 1\n");
+  for &sgid in supplementary_gids {
+    if sgid == gid || !seen.insert(sgid) {
+      continue;
+    }
+    gid_map.push_str(&format!("{sgid} {sgid} 1\n"));
+  }
+  println!("GID MAP {gid_map}");
   write_proc(child, "gid_map", &gid_map).context("gid_map")?;
 
   verify_map_written(child, "gid_map", &gid_map)

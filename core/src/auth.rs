@@ -6,7 +6,6 @@ use {
   std::{
     fs,
     io::{BufRead, BufReader},
-    os::fd::{FromRawFd, OwnedFd},
     str::FromStr
   }
 };
@@ -125,34 +124,33 @@ pub fn verify_not_mapped(child: Pid) -> anyhow::Result<()> {
   Ok(())
 }
 
-pub fn read_peer_groups(peer_pidfd: Pid) -> anyhow::Result<Vec<Gid>> {
-  let status_fd = unsafe {
-    libc::openat(
-      peer_pidfd,
-      c"status".as_ptr(),
-      libc::O_RDONLY | libc::O_CLOEXEC
-    )
-  };
-  if status_fd == -1 {
-    return Err(anyhow!(
-      "openat(peer_pidfd, \"status\"): {}",
-      std::io::Error::last_os_error()
-    ));
-  }
+pub fn read_peer_groups(peer_pid: Pid) -> anyhow::Result<Vec<Gid>> {
+  let fmt = format!("/proc/{peer_pid}/status");
 
-  let file: std::fs::File =
-    unsafe { std::fs::File::from(OwnedFd::from_raw_fd(status_fd)) };
+  let file = fs::File::open(fmt).context("Cannot open {fmt}")?;
+  let reader = BufReader::new(file);
+  let mut buf: Vec<u32> = Vec::new();
 
-  for line in BufReader::new(file).lines() {
-    let line = line.context("read peer status")?;
-    if let Some(rest) = line.strip_prefix("Groups:") {
-      return Ok(
-        rest.split_whitespace().filter_map(|s| s.parse::<Gid>().ok()).collect()
-      );
+  for line in reader.lines() {
+    if let Ok(line) = line &&
+      line.contains("Groups:")
+    {
+      let mut split = line.split_whitespace();
+      while let Some(s) = split.next() {
+        let parsed: u32 = match s.parse() {
+          | Ok(ok) => ok,
+          | Err(_) => continue
+        };
+        buf.push(parsed);
+      }
     }
   }
 
-  Ok(vec![])
+  if !buf.is_empty() {
+    return Ok(buf);
+  }
+
+  Err(anyhow!("No groups for this user"))
 }
 
 pub fn verify_in_userns(child: super::Pid) -> anyhow::Result<()> {
