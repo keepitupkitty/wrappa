@@ -1,0 +1,897 @@
+file ./core/src/connection.rs:
+use {
+  anyhow::Context,
+  serde::{Deserialize, Serialize},
+  std::{
+    io::{BufRead, BufReader, Write},
+    os::unix::net::UnixStream
+  },
+  tokio::io::AsyncWriteExt
+};
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub struct WrappaRequest {
+  pub child: super::Pid,
+  pub requested_gid: super::Gid,
+  pub requested_uid: super::Uid,
+  pub requested_capabilities: String,
+  pub needs_setgroups: bool
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "status")]
+pub enum WrappaResponse {
+  Ok,
+  Err { message: String }
+}
+
+pub async fn send_answer(
+  writer: &mut tokio::net::unix::OwnedWriteHalf,
+  resp: WrappaResponse
+) -> anyhow::Result<()> {
+  let mut json = serde_json::to_string(&resp).context("serialise response")?;
+  json.push('\n');
+  writer.write_all(json.as_bytes()).await.context("send response")?;
+  Ok(())
+}
+
+pub fn send_request(
+  server: &mut UnixStream,
+  request: &WrappaRequest
+) -> anyhow::Result<()> {
+  let mut json =
+    serde_json::to_string(&request).context("serialise request")?;
+  json.push('\n');
+  server.write_all(json.as_bytes()).context("send request")?;
+  Ok(())
+}
+
+pub fn receive_request_result(
+  server: &mut UnixStream
+) -> anyhow::Result<WrappaResponse> {
+  let mut reader = BufReader::new(server);
+  let mut line = String::new();
+  reader.read_line(&mut line).context("receive response")?;
+  let resp: WrappaResponse =
+    serde_json::from_str(line.trim()).context("parse response")?;
+  Ok(resp)
+}
+file ./core/src/policy.rs:
+use {
+  crate::{Gid, Uid},
+  anyhow::anyhow,
+  caps::Capability,
+  nix::unistd::{Group, User}
+};
+
+// TODO: Handle those when we will have config file support
+pub const ALLOWED_USERS: &[&str] = &["root", "veronica"];
+pub const ALLOWED_GROUPS: &[&str] = &["wheel", "sudo"];
+
+pub fn allowed_uids() -> Vec<Uid> {
+  ALLOWED_USERS
+    .iter()
+    .filter_map(|name| {
+      User::from_name(name).ok().flatten().map(|u| u.uid.as_raw())
+    })
+    .collect()
+}
+
+pub fn allowed_gids() -> Vec<Gid> {
+  ALLOWED_GROUPS
+    .iter()
+    .filter_map(|name| {
+      Group::from_name(name).ok().flatten().map(|g| g.gid.as_raw())
+    })
+    .collect()
+}
+
+pub fn is_admitted(
+  peer_uid: Uid,
+  peer_groups: &[Gid]
+) -> anyhow::Result<()> {
+  if peer_uid == 0 {
+    return Ok(());
+  }
+
+  let uids = allowed_uids();
+  if uids.contains(&peer_uid) {
+    return Ok(());
+  }
+
+  let gids = allowed_gids();
+  for peer_gid in peer_groups {
+    if gids.contains(peer_gid) {
+      return Ok(());
+    }
+  }
+
+  let user_str = ALLOWED_USERS.join(", ");
+  let group_str = ALLOWED_GROUPS.join(", ");
+  Err(anyhow!(
+    "uid {} is not in the allowed users [{}] or \
+     allowed groups [{}]",
+    peer_uid,
+    user_str,
+    group_str
+  ))
+}
+
+pub fn is_allowed_cap(cap: Capability) -> bool {
+  matches!(cap, |Capability::CAP_SYS_ADMIN)
+}
+
+pub fn is_allowed_cap_su(cap: Capability) -> bool {
+  matches!(cap, |Capability::CAP_SETUID| Capability::CAP_SETGID |
+    Capability::CAP_DAC_READ_SEARCH |
+    Capability::CAP_DAC_OVERRIDE)
+}
+file ./core/src/auth.rs:
+use {
+  crate::{Gid, Pid, Uid},
+  anyhow::{Context, anyhow},
+  caps::{CapSet, Capability},
+  nix::unistd::Group,
+  std::{
+    fs,
+    io::{BufRead, BufReader},
+    os::fd::{FromRawFd, OwnedFd},
+    str::FromStr
+  }
+};
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+struct PidFDInfo {
+  request_mask: u64,
+  cgroupid: u64,
+  pid: u32,
+  tgid: u32,
+  ppid: u32,
+  ruid: u32,
+  rgid: u32,
+  euid: u32,
+  egid: u32,
+  suid: u32,
+  sgid: u32,
+  fsuid: u32,
+  fsgid: u32,
+  spare0: [u32; 1]
+}
+
+nix::ioctl_readwrite!(pidfd_get_info, b'P', 1, PidFDInfo);
+
+pub fn validate_child_ownership(
+  child_pidfd: Pid,
+  child_pid: Pid,
+  peer_pid: Pid,
+  peer_uid: Uid,
+  peer_gid: Gid,
+  requested_uid: Uid,
+  requested_gid: Gid
+) -> anyhow::Result<()> {
+  let mut info: PidFDInfo = Default::default();
+  unsafe {
+    pidfd_get_info(child_pidfd, &mut info).with_context(|| {
+      format!("Cannot get file descriptor information for pid {}", child_pid)
+    })?;
+  }
+
+  if info.ppid == 0 {
+    return Err(anyhow!(
+      "child PID {} has ppid=0, which is not a valid userspace parent",
+      child_pid
+    ));
+  }
+
+  if info.ppid != peer_pid as u32 {
+    return Err(anyhow!(
+      "child PID {} parent is {} but requester pid is {}",
+      child_pid,
+      info.ppid,
+      peer_pid
+    ));
+  }
+
+  if info.ruid != peer_uid || info.rgid != peer_gid {
+    return Err(anyhow!(
+      "child PID {} owned by uid={} gid={} (peer is uid={} gid={})",
+      child_pid,
+      info.ruid,
+      info.rgid,
+      peer_uid,
+      peer_gid
+    ));
+  }
+
+  if peer_uid != 0 {
+    if requested_uid != peer_uid {
+      return Err(anyhow!(
+        "uid {} may not request mapping to uid {} (must map own uid)",
+        peer_uid,
+        requested_uid
+      ));
+    }
+    if requested_gid != peer_gid {
+      return Err(anyhow!(
+        "gid {} may not request mapping to gid {} (must map own gid)",
+        peer_gid,
+        requested_gid
+      ));
+    }
+  }
+
+  Ok(())
+}
+
+pub fn verify_not_mapped(child: Pid) -> anyhow::Result<()> {
+  let uid_map_path = format!("/proc/{}/uid_map", child);
+  let content = fs::read_to_string(&uid_map_path)
+    .with_context(|| format!("read {}", uid_map_path))?;
+
+  if !content.trim().is_empty() {
+    return Err(anyhow!(
+      "child pid {} uid_map is already written ({:?}), \
+       refusing to re-map",
+      child,
+      content.trim()
+    ));
+  }
+
+  let gid_map_path = format!("/proc/{}/gid_map", child);
+  let content = fs::read_to_string(&gid_map_path)
+    .with_context(|| format!("read {}", gid_map_path))?;
+
+  if !content.trim().is_empty() {
+    return Err(anyhow!(
+      "child pid {} gid_map is already written ({:?}), \
+       refusing to re-map",
+      child,
+      content.trim()
+    ));
+  }
+
+  Ok(())
+}
+
+pub fn read_peer_groups(peer_pidfd: Pid) -> anyhow::Result<Vec<Gid>> {
+  let status_fd = unsafe {
+    libc::openat(
+      peer_pidfd,
+      c"status".as_ptr(),
+      libc::O_RDONLY | libc::O_CLOEXEC
+    )
+  };
+  if status_fd == -1 {
+    return Err(anyhow!(
+      "openat(peer_pidfd, \"status\"): {}",
+      std::io::Error::last_os_error()
+    ));
+  }
+
+  let file: std::fs::File =
+    unsafe { std::fs::File::from(OwnedFd::from_raw_fd(status_fd)) };
+
+  for line in BufReader::new(file).lines() {
+    let line = line.context("read peer status")?;
+    if let Some(rest) = line.strip_prefix("Groups:") {
+      return Ok(
+        rest.split_whitespace().filter_map(|s| s.parse::<Gid>().ok()).collect()
+      );
+    }
+  }
+
+  Ok(vec![])
+}
+
+pub fn verify_in_userns(child: super::Pid) -> anyhow::Result<()> {
+  let child_ns = fs::read_link(format!("/proc/{}/ns/user", child))
+    .context("readlink child userns")?;
+  let init_ns =
+    fs::read_link("/proc/1/ns/user").context("readlink init userns")?;
+
+  if child_ns == init_ns {
+    return Err(anyhow!(
+      "child pid {} is not in a new user namespace \
+             (userns matches init: {:?})",
+      child,
+      child_ns
+    ));
+  }
+
+  Ok(())
+}
+
+pub fn parse_caps(s: &str) -> anyhow::Result<Vec<Capability>> {
+  if s.trim().is_empty() {
+    return Ok(vec![]);
+  }
+  s.split(',')
+    .map(|name| {
+      let name = name.trim().to_uppercase();
+      let name =
+        if name.starts_with("CAP_") { name } else { format!("CAP_{}", name) };
+      Capability::from_str(&name)
+        .map_err(|_| anyhow!("unknown capability: {}", name))
+    })
+    .collect()
+}
+
+pub fn administrator_gid(admin_group: &str) -> anyhow::Result<super::Gid> {
+  Group::from_name(admin_group)?
+    .map(|g| g.gid.as_raw())
+    .ok_or_else(|| anyhow!("Administrator group not found"))
+}
+
+pub fn check_policy(
+  peer_uid: Uid,
+  peer_groups: &[Gid],
+  request: &super::connection::WrappaRequest
+) -> anyhow::Result<()> {
+  super::policy::is_admitted(peer_uid, peer_groups)?;
+
+  if peer_uid != 0 {
+    let requested = parse_caps(&request.requested_capabilities)?;
+    for cap in &requested {
+      if request.needs_setgroups {
+        if !super::policy::is_allowed_cap_su(*cap) {
+          return Err(anyhow!("capability {:?} not permitted by policy", cap));
+        }
+      } else if !super::policy::is_allowed_cap(*cap) {
+        return Err(anyhow!("capability {:?} not permitted by policy", cap));
+      }
+    }
+  }
+
+  Ok(())
+}
+
+pub fn set_capabilities(
+  request: &super::connection::WrappaRequest
+) -> anyhow::Result<()> {
+  let wanted = parse_caps(&request.requested_capabilities)?;
+
+  let all_caps = caps::all();
+
+  for cap in &all_caps {
+    if !wanted.contains(cap) {
+      let _ = caps::drop(None, CapSet::Permitted, *cap);
+    }
+  }
+
+  for cap in &all_caps {
+    if wanted.contains(cap) {
+      let _ = caps::raise(None, CapSet::Effective, *cap);
+      let _ = caps::raise(None, CapSet::Inheritable, *cap);
+    } else {
+      let _ = caps::drop(None, CapSet::Effective, *cap);
+      let _ = caps::drop(None, CapSet::Inheritable, *cap);
+    }
+  }
+
+  Ok(())
+}
+file ./core/src/idmap.rs:
+use {anyhow::Context, std::fs};
+
+fn proc_path(
+  pid: super::Pid,
+  file: &str
+) -> String {
+  format!("/proc/{}/{}", pid, file)
+}
+
+fn write_proc(
+  pid: super::Pid,
+  file: &str,
+  content: &str
+) -> anyhow::Result<()> {
+  let path = proc_path(pid, file);
+  fs::write(&path, content).with_context(|| format!("write {}", path))
+}
+
+fn verify_map_written(
+  pid: super::Pid,
+  file: &str,
+  expected: &str
+) -> anyhow::Result<()> {
+  let path = proc_path(pid, file);
+  let actual =
+    fs::read_to_string(&path).with_context(|| format!("readback {}", path))?;
+
+  // The kernel may add trailing whitespace or normalise spacing.
+  // Compare field by field: inner_uid outer_uid count
+  let parse_map = |s: &str| -> Option<(u64, u64, u64)> {
+    let mut parts = s.split_whitespace();
+    let a = parts.next()?.parse().ok()?;
+    let b = parts.next()?.parse().ok()?;
+    let c = parts.next()?.parse().ok()?;
+    Some((a, b, c))
+  };
+
+  let expected_parsed = parse_map(expected).ok_or_else(|| {
+    anyhow::anyhow!("could not parse expected {} content: {:?}", file, expected)
+  })?;
+  let actual_parsed = parse_map(&actual).ok_or_else(|| {
+    anyhow::anyhow!(
+      "could not parse readback {} content: {:?} (expected {:?})",
+      file,
+      actual,
+      expected
+    )
+  })?;
+
+  if expected_parsed != actual_parsed {
+    return Err(anyhow::anyhow!(
+      "{} readback mismatch: wrote {:?}, read back {:?}",
+      path,
+      expected.trim(),
+      actual.trim()
+    ));
+  }
+
+  Ok(())
+}
+
+pub fn write_idmaps(
+  child: super::Pid,
+  uid: super::Uid,
+  gid: super::Gid,
+  needs_setgroups: bool
+) -> anyhow::Result<()> {
+  let setgroups_val = if needs_setgroups { "allow" } else { "deny" };
+  write_proc(child, "setgroups", setgroups_val).context("setgroups")?;
+
+  let uid_map = format!("0 {} 1\n", uid);
+  write_proc(child, "uid_map", &uid_map).context("uid_map")?;
+
+  verify_map_written(child, "uid_map", &uid_map)
+    .context("uid_map readback verification")?;
+
+  let gid_map = format!("0 {} 1\n", gid);
+  write_proc(child, "gid_map", &gid_map).context("gid_map")?;
+
+  verify_map_written(child, "gid_map", &gid_map)
+    .context("gid_map readback verification")?;
+
+  Ok(())
+}
+file ./core/src/lib.rs:
+/*
+ * Copyright (C) 2026 rsec GNU/Linux
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+use {
+  anyhow::{Context, anyhow},
+  nix::sys::utsname::uname
+};
+
+pub mod auth;
+pub mod connection;
+pub mod idmap;
+pub mod policy;
+
+pub type Pid = libc::pid_t;
+pub type Uid = libc::uid_t;
+pub type Gid = libc::gid_t;
+
+pub const WRAPPA_SOCKET: &'static str = "/run/wrappad.sock";
+
+const REQUIRED_KERNEL_MAJOR: u32 = 6;
+const REQUIRED_KERNEL_MINOR: u32 = 13;
+
+pub fn require_kernel_version() -> anyhow::Result<()> {
+  let uts = uname().context("Failed to call uname")?;
+  let version =
+    uts.release().to_str().context("Malformed kerrnel version string")?;
+  let kver = version.splitn(2, '.');
+  let major: u32 =
+    kver.clone().next().context("Cannot get major kernel version")?.parse()?;
+  let minor: u32 =
+    kver.clone().next().context("Cannot get minor kernel version")?.parse()?;
+
+  if (major, minor) < (REQUIRED_KERNEL_MAJOR, REQUIRED_KERNEL_MINOR) {
+    return Err(anyhow!(
+      "kernel {}.{} is too old: wrappad requires >= {}.{} \
+       (PIDFD_GET_INFO with full credential fields)",
+      major,
+      minor,
+      REQUIRED_KERNEL_MAJOR,
+      REQUIRED_KERNEL_MINOR
+    ));
+  }
+
+  Ok(())
+}
+file ./wrappad/src/main.rs:
+/*
+ * Copyright (C) 2026 rsec GNU/Linux
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+use {
+  anyhow::{Context, anyhow},
+  nix::unistd::{chown, getresgid, getresuid},
+  std::{
+    fs,
+    os::{
+      raw::{c_int, c_uint},
+      unix::fs::PermissionsExt
+    },
+    path::Path
+  },
+  tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    net::{UnixListener, UnixStream}
+  },
+  wrappa_core::{
+    WRAPPA_SOCKET,
+    auth,
+    connection::{self, WrappaRequest, WrappaResponse},
+    idmap
+  }
+};
+
+unsafe extern "C" {
+  fn pidfd_open(
+    pid: libc::pid_t,
+    flags: c_uint
+  ) -> c_int;
+}
+
+fn is_uid_superuser() -> anyhow::Result<bool> {
+  let result = getresuid().context("getresuid")?;
+  Ok(
+    result.real == 0.into() &&
+      result.effective == 0.into() &&
+      result.saved == 0.into()
+  )
+}
+
+fn is_gid_superuser() -> anyhow::Result<bool> {
+  let result = getresgid().context("getresgid")?;
+  Ok(
+    result.real == 0.into() &&
+      result.effective == 0.into() &&
+      result.saved == 0.into()
+  )
+}
+
+fn chown_socket(path: &Path) -> anyhow::Result<()> {
+  let adm_gid = auth::administrator_gid("wheel")?;
+  if let Err(e) = chown(path, Some(0.into()), Some(adm_gid.into())) {
+    return Err(anyhow!(
+      "Cannot change ownhership of \"{WRAPPA_SOCKET}\": {e}"
+    ));
+  }
+  Ok(())
+}
+
+async fn handle_client(stream: UnixStream) -> anyhow::Result<()> {
+  let cred = stream.peer_cred().context("SO_PEERCRED")?;
+
+  let peer_uid = cred.uid();
+  let peer_gid = cred.gid();
+  let peer_pid = cred.pid().ok_or_else(|| anyhow!("peer pid unavailable"))?;
+
+  println!(
+    "connection from pid={} uid={} gid={}",
+    peer_pid, peer_uid, peer_gid
+  );
+
+  let (read_half, mut write_half) = stream.into_split();
+
+  let mut reader = BufReader::new(read_half);
+
+  let mut line = String::new();
+  reader.read_line(&mut line).await.context("read request")?;
+
+  let req: WrappaRequest =
+    serde_json::from_str(line.trim()).context("parse request")?;
+
+  println!(
+    "request: child={} uid={} gid={} caps={:?} setgroups={}",
+    req.child,
+    req.requested_uid,
+    req.requested_gid,
+    req.requested_capabilities,
+    req.needs_setgroups,
+  );
+
+  let child_pidfd: wrappa_core::Pid = unsafe { pidfd_open(req.child, 0) };
+  if child_pidfd == -1 {
+    return Err(anyhow!(
+      "Cannot obtain pidfd for {}: {}",
+      req.child,
+      std::io::Error::last_os_error()
+    ));
+  }
+
+  let peer_pidfd: wrappa_core::Pid = unsafe { pidfd_open(peer_pid, 0) };
+  if peer_pidfd == -1 {
+    return Err(anyhow!(
+      "Cannot obtain pidfd for {}: {}",
+      peer_pid,
+      std::io::Error::last_os_error()
+    ));
+  }
+
+  if let Err(e) = auth::validate_child_ownership(
+    child_pidfd,
+    req.child,
+    peer_pid,
+    peer_uid,
+    peer_gid,
+    req.requested_uid,
+    req.requested_gid
+  ) {
+    eprintln!("child ownership check failed: {}", e);
+    connection::send_answer(
+      &mut write_half,
+      WrappaResponse::Err { message: e.to_string() }
+    )
+    .await?;
+    return Ok(());
+  }
+
+  let peer_groups = auth::read_peer_groups(peer_pidfd).unwrap_or_default();
+
+  if let Err(e) = auth::check_policy(peer_uid, &peer_groups, &req) {
+    eprintln!("denied uid={}: {}", peer_uid, e);
+    connection::send_answer(
+      &mut write_half,
+      WrappaResponse::Err { message: e.to_string() }
+    )
+    .await?;
+    return Ok(());
+  }
+
+  if let Err(e) = auth::parse_caps(&req.requested_capabilities) {
+    connection::send_answer(
+      &mut write_half,
+      WrappaResponse::Err { message: format!("bad capabilities: {}", e) }
+    )
+    .await?;
+    return Ok(());
+  }
+
+  if let Err(e) = auth::verify_in_userns(req.child) {
+    connection::send_answer(
+      &mut write_half,
+      WrappaResponse::Err { message: e.to_string() }
+    )
+    .await?;
+    return Ok(());
+  }
+
+  if let Err(e) = auth::verify_not_mapped(req.child) {
+    eprintln!("remap attempt for child={}: {}", req.child, e);
+    connection::send_answer(
+      &mut write_half,
+      WrappaResponse::Err { message: e.to_string() }
+    )
+    .await?;
+    return Ok(());
+  }
+
+  let child = req.child;
+  let req_uid = req.requested_uid;
+  let req_gid = req.requested_gid;
+  let setgroups = req.needs_setgroups;
+
+  tokio::task::spawn_blocking(move || {
+    idmap::write_idmaps(child, req_uid, req_gid, setgroups)
+  })
+  .await
+  .context("spawn_blocking idmaps")??;
+
+  println!(
+    "wrote idmaps for child={}: uid={}->0 gid={}->0 setgroups={}",
+    req.child,
+    req.requested_uid,
+    req.requested_gid,
+    if req.needs_setgroups { "allow" } else { "deny" },
+  );
+
+  connection::send_answer(&mut write_half, WrappaResponse::Ok).await?;
+
+  Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+  let path = Path::new(WRAPPA_SOCKET);
+
+  wrappa_core::require_kernel_version()?;
+
+  let is_root_uid = is_uid_superuser()?;
+  let is_root_gid = is_gid_superuser()?;
+
+  if !(is_root_gid && is_root_uid) {
+    return Err(anyhow!("wrappad must run as root"));
+  }
+
+  if path.exists() {
+    if let Err(e) = fs::remove_file(path) {
+      return Err(anyhow!("Cannot unlink the socket: {e}"));
+    }
+  }
+
+  let listener = UnixListener::bind(path).context("bind")?;
+
+  fs::set_permissions(path, fs::Permissions::from_mode(0o660))
+    .context("chmod socket")?;
+
+  if let Err(e) = chown_socket(path) {
+    return Err(anyhow!("{e}"));
+  }
+
+  loop {
+    match listener.accept().await {
+      | Ok((stream, _)) => {
+        tokio::spawn(async move {
+          if let Err(e) = handle_client(stream).await {
+            return Err(anyhow!("handler error: {:#}", e));
+          }
+          Ok(())
+        });
+      },
+      | Err(e) => return Err(anyhow!("{e}"))
+    }
+  }
+}
+file ./wrappa/src/main.rs:
+use {
+  anyhow::{Context, anyhow},
+  clap::Parser,
+  nix::{
+    sched::{CloneFlags, clone},
+    sys::{
+      resource::{Resource, getrlimit},
+      signal::{Signal, kill},
+      wait::{WaitStatus, waitpid}
+    },
+    unistd::pipe
+  },
+  std::{
+    os::{fd::OwnedFd, unix::net::UnixStream},
+    process::exit
+  },
+  wrappa_core::{WRAPPA_SOCKET, connection}
+};
+
+#[derive(Parser, Debug)]
+#[command(name = "wrappa", allow_hyphen_values = true)]
+#[command(about = "A client that wraps and isolates setuid programs", long_about = None)]
+pub struct Args {
+  /// Map desired user ID to the sandbox
+  #[arg(short = 'u', long)]
+  pub uid: u32,
+
+  /// Map desired group ID to the sandbox
+  #[arg(short = 'g', long)]
+  pub gid: u32,
+
+  /// Specify desired capabilities to use withing the sandbox
+  #[arg(short = 'c', long)]
+  pub caps: String,
+
+  /// Specify whether you need setgroups to be available in sandbox or not
+  #[arg(long, default_value_t = false)]
+  pub setgroups: bool,
+
+  /// Command to execute
+  #[arg(last = true, required = true)]
+  pub command: Vec<String>
+}
+
+fn main() -> anyhow::Result<()> {
+  let args = Args::parse();
+
+  let mut stream = UnixStream::connect(WRAPPA_SOCKET)
+    .context("cannot connect to wrappa socket")?;
+
+  let argv0 = &args.command[0];
+  if !argv0.starts_with('/') {
+    return Err(anyhow::anyhow!(
+      "binary must be an absolute path, got {:?}",
+      argv0
+    ));
+  }
+
+  let argv0_args: &[String] = &args.command[1..];
+
+  let caps = args.caps;
+  let setgroups = args.setgroups;
+  let gid = args.gid;
+  let uid = args.uid;
+
+  let (write_fd, read_fd): (OwnedFd, OwnedFd) = match pipe() {
+    | Ok(s) => s,
+    | Err(e) => return Err(anyhow!("Cannot crate pipe: {e}"))
+  };
+
+  let (stack_size, _) = match getrlimit(Resource::RLIMIT_STACK) {
+    | Ok(s) => s,
+    | Err(e) => return Err(anyhow!("Cannot get stack size limit: {e}"))
+  };
+  let stack_size: usize =
+    if stack_size > usize::MAX as u64 { 8192 } else { stack_size as usize };
+
+  let mut stack: Vec<u8> = vec![0u8; stack_size];
+
+  let child_callback: Box<dyn FnMut() -> isize> = Box::new(|| {
+    drop(write_fd.try_clone());
+    println!("We are in the child!!!");
+    println!("cmds: {:#?}", argv0_args);
+    let status = std::process::Command::new("id")
+      .status()
+      .expect("Failed to execute command");
+    status.code().unwrap_or(-1) as isize
+  });
+
+  let clone_flags = CloneFlags::CLONE_NEWUSER;
+
+  let child_pid = unsafe {
+    clone(
+      child_callback,
+      stack.as_mut_slice(),
+      clone_flags,
+      Some(Signal::SIGCHLD as i32)
+    )?
+  };
+
+  let request = connection::WrappaRequest {
+    child: child_pid.as_raw(),
+    requested_gid: gid,
+    requested_uid: uid,
+    requested_capabilities: caps,
+    needs_setgroups: setgroups
+  };
+
+  drop(read_fd);
+
+  if let Err(e) = connection::send_request(&mut stream, &request) {
+    drop(write_fd.try_clone());
+    kill(child_pid, Some(Signal::SIGKILL))?;
+    return Err(anyhow!("Failed to send request: {e}"));
+  }
+
+  drop(write_fd);
+
+  match waitpid(child_pid, None) {
+    | Ok(WaitStatus::Exited(_, status)) => {
+      exit(status.into());
+    },
+    | Ok(WaitStatus::Signaled(_, signal, _)) => {
+      exit(128 + signal as i32);
+    },
+    | Err(e) => return Err(anyhow!("waitpid failed: {e}")),
+    | _ => return Ok(())
+  }
+}

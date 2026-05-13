@@ -30,7 +30,7 @@ struct PidFDInfo {
   spare0: [u32; 1]
 }
 
-nix::ioctl_readwrite!(pidfd_get_info, b'P', 1, PidFDInfo);
+nix::ioctl_readwrite!(pidfd_get_info, 0xFF, 11, PidFDInfo);
 
 pub fn validate_child_ownership(
   child_pidfd: Pid,
@@ -43,8 +43,9 @@ pub fn validate_child_ownership(
 ) -> anyhow::Result<()> {
   let mut info: PidFDInfo = Default::default();
   unsafe {
-    pidfd_get_info(child_pidfd, &mut info)
-      .with_context(|| format!("PIDFD_GET_INFO for pid {}", child_pid))?;
+    pidfd_get_info(child_pidfd, &mut info).with_context(|| {
+      format!("Cannot get file descriptor information for pid {}", child_pid)
+    })?;
   }
 
   if info.ppid == 0 {
