@@ -9,11 +9,11 @@ use {
       signal::{Signal, kill},
       wait::{WaitStatus, waitpid}
     },
-    unistd::{execve, getgid, getuid, pipe}
+    unistd::{execve, getgid, getuid}
   },
   std::{
     ffi::CStr,
-    os::{fd::OwnedFd, unix::net::UnixStream},
+    os::{raw::c_void, unix::net::UnixStream},
     process::exit
   },
   wrappa_core::{
@@ -69,10 +69,13 @@ fn main() -> anyhow::Result<()> {
   let gid = args.gid.unwrap_or(getgid().into());
   let uid = args.uid.unwrap_or(getuid().into());
 
-  let (write_fd, read_fd): (OwnedFd, OwnedFd) = match pipe() {
-    | Ok(s) => s,
-    | Err(e) => return Err(anyhow!("Cannot crate pipe: {e}"))
-  };
+  let mut fds = [0i32; 2];
+  if unsafe { libc::pipe(fds.as_mut_ptr()) == -1 } {
+    return Err(anyhow!(
+      "Cannot crate a pipe: {}",
+      std::io::Error::last_os_error()
+    ));
+  }
 
   let (stack_size, _) = match getrlimit(Resource::RLIMIT_STACK) {
     | Ok(s) => s,
@@ -84,11 +87,20 @@ fn main() -> anyhow::Result<()> {
   let mut stack: Vec<u8> = vec![0u8; stack_size];
 
   let child_callback: Box<dyn FnMut() -> isize> = Box::new(|| {
-    drop(write_fd.try_clone());
+    unsafe { libc::close(fds[1]) };
 
-    let mut buf = [0u8; 1];
-    let _ = nix::unistd::read(&read_fd, &mut buf);
-    drop(read_fd.try_clone());
+    let mut ch: u8 = 0;
+
+    if unsafe { libc::read(fds[0], &mut ch as *mut u8 as *mut c_void, 1) != 0 }
+    {
+      eprintln!(
+        "Failure in child: read from pipe returned: {}",
+        std::io::Error::last_os_error()
+      );
+      exit(127);
+    }
+
+    unsafe { libc::close(fds[0]) };
 
     // Need filesystem and PID namespace
     // TODO: mount /dev as tmpfs and bind only needed stuff RIGHT HERE
@@ -155,7 +167,7 @@ fn main() -> anyhow::Result<()> {
         unsafe { libc::prctl(libc::PR_SET_SECUREBITS, securebits, 0, 0, 0) };
       if ret != 0 {
         eprintln!(
-          "wrappa: warning: PR_SET_SECUREBITS failed: {}",
+          "PR_SET_SECUREBITS failed: {}",
           std::io::Error::last_os_error()
         );
         exit(127);
@@ -204,15 +216,15 @@ fn main() -> anyhow::Result<()> {
     needs_setgroups: setgroups
   };
 
-  drop(read_fd);
+  //drop(read_fd);
 
   if let Err(e) = connection::send_request(&mut stream, &request) {
-    drop(write_fd.try_clone());
+    unsafe { libc::close(fds[1]) };
     kill(child_pid, Some(Signal::SIGKILL))?;
     return Err(anyhow!("Failed to send request: {e}"));
   }
 
-  drop(write_fd);
+  unsafe { libc::close(fds[1]) };
 
   match waitpid(child_pid, None) {
     | Ok(WaitStatus::Exited(_, status)) => {
