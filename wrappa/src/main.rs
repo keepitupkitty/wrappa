@@ -1,5 +1,6 @@
 use {
   anyhow::{Context, anyhow},
+  caps::{CapSet, Capability},
   clap::Parser,
   nix::{
     sched::{CloneFlags, clone},
@@ -106,7 +107,6 @@ fn main() -> anyhow::Result<()> {
     }
     unsafe { libc::close(fds[0]) };
 
-    use caps::{CapSet, Capability};
     let all_caps = caps::all();
     let wanted: Vec<Capability> = match auth::parse_caps(&caps) {
       | Ok(result) => result,

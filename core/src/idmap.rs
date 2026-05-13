@@ -73,8 +73,6 @@ pub fn write_idmaps(
   verify_map_written(child, "uid_map", &uid_map)
     .context("uid_map readback verification")?;
 
-  println!("sup {:#?}", supplementary_gids);
-
   let mut seen = std::collections::HashSet::new();
   let mut gid_map = format!("0 0 1\n{gid} {gid} 1\n");
   for &sgid in supplementary_gids {
@@ -83,7 +81,6 @@ pub fn write_idmaps(
     }
     gid_map.push_str(&format!("{sgid} {sgid} 1\n"));
   }
-  println!("GID MAP {gid_map}");
   write_proc(child, "gid_map", &gid_map).context("gid_map")?;
 
   verify_map_written(child, "gid_map", &gid_map)
