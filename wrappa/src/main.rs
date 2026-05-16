@@ -39,10 +39,6 @@ pub struct Args {
   #[arg(short = 'c', long)]
   pub caps: String,
 
-  /// Specify whether you need setgroups to be available in sandbox or not
-  #[arg(long, default_value_t = false)]
-  pub setgroups: bool,
-
   /// Command to execute
   #[arg(last = true, required = true)]
   pub command: Vec<String>
@@ -65,7 +61,6 @@ fn main() -> anyhow::Result<()> {
   let argv0_args: &[String] = &args.command[1..];
 
   let caps = args.caps;
-  let setgroups = args.setgroups;
   let gid = args.gid.unwrap_or(getgid().into());
   let uid = args.uid.unwrap_or(getuid().into());
 
@@ -136,55 +131,53 @@ fn main() -> anyhow::Result<()> {
 
     unsafe { libc::close(stream.as_raw_fd()) };
 
-    if setgroups {
-      if caps::has_cap(None, CapSet::Effective, Capability::CAP_SETPCAP)
-        .unwrap_or(false)
-      {
-        let securebits: libc::c_int = libc::SECBIT_KEEP_CAPS |
-          libc::SECBIT_KEEP_CAPS_LOCKED |
-          libc::SECBIT_NOROOT |
-          libc::SECBIT_NOROOT_LOCKED;
-        let ret =
-          unsafe { libc::prctl(libc::PR_SET_SECUREBITS, securebits, 0, 0, 0) };
-        if ret != 0 {
-          eprintln!(
-            "PR_SET_SECUREBITS failed: {}",
-            std::io::Error::last_os_error()
-          );
-          exit(127);
-        }
-      }
-
-      let gid_objs: Vec<nix::unistd::Gid> =
-        groups.iter().map(|&g| nix::unistd::Gid::from_raw(g)).collect();
-      if let Err(e) = nix::unistd::setgroups(&gid_objs) {
-        eprintln!("setgroups failed: {e}");
+    if caps::has_cap(None, CapSet::Effective, Capability::CAP_SETPCAP)
+      .unwrap_or(false)
+    {
+      let securebits: libc::c_int = libc::SECBIT_KEEP_CAPS |
+        libc::SECBIT_KEEP_CAPS_LOCKED |
+        libc::SECBIT_NOROOT |
+        libc::SECBIT_NOROOT_LOCKED;
+      let ret =
+        unsafe { libc::prctl(libc::PR_SET_SECUREBITS, securebits, 0, 0, 0) };
+      if ret != 0 {
+        eprintln!(
+          "PR_SET_SECUREBITS failed: {}",
+          std::io::Error::last_os_error()
+        );
         exit(127);
       }
-      if let Err(e) = setgid(gid.into()) {
-        eprintln!("setgid failed: {e}");
-        exit(127);
-      }
-      if let Err(e) = setuid(uid.into()) {
-        eprintln!("setuid failed: {e}");
-        exit(127);
-      }
+    }
 
-      for cap in &all_caps {
-        if wanted.contains(cap) {
-          let _ = caps::raise(None, CapSet::Effective, *cap);
-          let _ = caps::raise(None, CapSet::Inheritable, *cap);
-        } else {
-          let _ = caps::drop(None, CapSet::Effective, *cap);
-          let _ = caps::drop(None, CapSet::Inheritable, *cap);
-        }
-      }
+    let gid_objs: Vec<nix::unistd::Gid> =
+      groups.iter().map(|&g| nix::unistd::Gid::from_raw(g)).collect();
+    if let Err(e) = nix::unistd::setgroups(&gid_objs) {
+      eprintln!("setgroups failed: {e}");
+      exit(127);
+    }
+    if let Err(e) = setgid(gid.into()) {
+      eprintln!("setgid failed: {e}");
+      exit(127);
+    }
+    if let Err(e) = setuid(uid.into()) {
+      eprintln!("setuid failed: {e}");
+      exit(127);
+    }
 
-      for cap in &wanted {
-        if let Err(e) = caps::raise(None, CapSet::Ambient, *cap) {
-          eprintln!("ambient raise {:?} failed: {}", cap, e);
-          exit(127);
-        }
+    for cap in &all_caps {
+      if wanted.contains(cap) {
+        let _ = caps::raise(None, CapSet::Effective, *cap);
+        let _ = caps::raise(None, CapSet::Inheritable, *cap);
+      } else {
+        let _ = caps::drop(None, CapSet::Effective, *cap);
+        let _ = caps::drop(None, CapSet::Inheritable, *cap);
+      }
+    }
+
+    for cap in &wanted {
+      if let Err(e) = caps::raise(None, CapSet::Ambient, *cap) {
+        eprintln!("ambient raise {:?} failed: {}", cap, e);
+        exit(127);
       }
     }
 
@@ -232,8 +225,7 @@ fn main() -> anyhow::Result<()> {
     child: child_pid.as_raw(),
     requested_gid: gid,
     requested_uid: uid,
-    requested_capabilities: caps,
-    needs_setgroups: setgroups
+    requested_capabilities: caps
   };
 
   if let Err(e) = connection::send_request(&mut stream, &request) {

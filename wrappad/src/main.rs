@@ -96,12 +96,8 @@ async fn handle_client(stream: UnixStream) -> anyhow::Result<()> {
     serde_json::from_str(line.trim()).context("parse request")?;
 
   println!(
-    "request: child={} uid={} gid={} caps={:?} setgroups={}",
-    req.child,
-    req.requested_uid,
-    req.requested_gid,
-    req.requested_capabilities,
-    req.needs_setgroups,
+    "request: child={} uid={} gid={} caps={:?}",
+    req.child, req.requested_uid, req.requested_gid, req.requested_capabilities
   );
 
   let child_pidfd: wrappa_core::Pid = unsafe { pidfd_open(req.child, 0) };
@@ -184,20 +180,16 @@ async fn handle_client(stream: UnixStream) -> anyhow::Result<()> {
   let child = req.child;
   let req_uid = req.requested_uid;
   let req_gid = req.requested_gid;
-  let setgroups = req.needs_setgroups;
 
   tokio::task::spawn_blocking(move || {
-    idmap::write_idmaps(child, req_uid, req_gid, &peer_groups, setgroups)
+    idmap::write_idmaps(child, req_uid, req_gid, &peer_groups)
   })
   .await
   .context("spawn_blocking idmaps")??;
 
   println!(
-    "wrote idmaps for child={}: uid={}->0 gid={}->0 setgroups={}",
-    req.child,
-    req.requested_uid,
-    req.requested_gid,
-    if req.needs_setgroups { "allow" } else { "deny" },
+    "wrote idmaps for child={}: uid={}->0 gid={}->0",
+    req.child, req.requested_uid, req.requested_gid
   );
 
   connection::send_answer(&mut write_half, WrappaResponse::Ok).await?;

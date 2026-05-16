@@ -59,10 +59,6 @@ pub fn is_admitted(
 }
 
 pub fn is_allowed_cap(cap: Capability) -> bool {
-  matches!(cap, |Capability::CAP_SYS_ADMIN)
-}
-
-pub fn is_allowed_cap_su(cap: Capability) -> bool {
   matches!(cap, |Capability::CAP_SETUID| Capability::CAP_SETGID |
     Capability::CAP_DAC_READ_SEARCH |
     Capability::CAP_SETPCAP)

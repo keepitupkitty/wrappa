@@ -61,11 +61,9 @@ pub fn write_idmaps(
   child: super::Pid,
   uid: super::Uid,
   gid: super::Gid,
-  supplementary_gids: &[super::Gid],
-  needs_setgroups: bool
+  supplementary_gids: &[super::Gid]
 ) -> anyhow::Result<()> {
-  let setgroups_val = if needs_setgroups { "allow" } else { "deny" };
-  write_proc(child, "setgroups", setgroups_val).context("setgroups")?;
+  write_proc(child, "setgroups", "allow").context("setgroups")?;
 
   let uid_map = if uid == 0 {
     "0 0 1\n".to_string()

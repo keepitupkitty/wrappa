@@ -221,11 +221,7 @@ pub fn check_policy(
   if peer_uid != 0 {
     let requested = parse_caps(&request.requested_capabilities)?;
     for cap in &requested {
-      if request.needs_setgroups {
-        if !super::policy::is_allowed_cap_su(*cap) {
-          return Err(anyhow!("capability {:?} not permitted by policy", cap));
-        }
-      } else if !super::policy::is_allowed_cap(*cap) {
+      if !super::policy::is_allowed_cap(*cap) {
         return Err(anyhow!("capability {:?} not permitted by policy", cap));
       }
     }
