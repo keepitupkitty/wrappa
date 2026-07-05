@@ -89,6 +89,7 @@ fn main() -> anyhow::Result<()> {
 
   let groups = orig_groups.clone();
 
+  // Child
   let child_callback: Box<dyn FnMut() -> isize> = Box::new(|| {
     unsafe { libc::close(fds[1]) };
     let mut ch: u8 = 0;
@@ -210,6 +211,7 @@ fn main() -> anyhow::Result<()> {
     CloneFlags::CLONE_NEWPID |
     CloneFlags::CLONE_NEWUTS;
 
+  // Do clone
   let child_pid = unsafe {
     clone(
       child_callback,
@@ -219,8 +221,10 @@ fn main() -> anyhow::Result<()> {
     )?
   };
 
+  // Sync with child
   unsafe { libc::close(fds[0]) };
 
+  // Make request
   let request = connection::WrappaRequest {
     child: child_pid.as_raw(),
     requested_gid: gid,
@@ -228,6 +232,7 @@ fn main() -> anyhow::Result<()> {
     requested_capabilities: caps
   };
 
+  // Send request
   if let Err(e) = connection::send_request(&mut stream, &request) {
     unsafe { libc::close(fds[1]) };
     kill(child_pid, Some(Signal::SIGKILL))?;

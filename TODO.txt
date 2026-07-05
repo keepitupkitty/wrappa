@@ -1,0 +1,5 @@
+1. Make this daemon to check if the caller user is "wheel" (and not other groups because of socket permission)
+2. Add anti-ddos protection
+3. apply highly restriction seccomp filters (syscalls + permit ONLY AF_INET and AF_INET6 and AF_UNIX)
+4. apply landlock/unveil policy for wrappad
+5. sandbox filesystem in child
