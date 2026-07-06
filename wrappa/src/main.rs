@@ -27,14 +27,6 @@ use {
 #[command(name = "wrappa", allow_hyphen_values = true)]
 #[command(about = "A client that wraps and isolates setuid programs", long_about = None)]
 pub struct Args {
-  /// Map desired user ID to the sandbox
-  #[arg(short = 'u', long)]
-  pub uid: Option<u32>,
-
-  /// Map desired group ID to the sandbox
-  #[arg(short = 'g', long)]
-  pub gid: Option<u32>,
-
   /// Specify desired capabilities to use withing the sandbox
   #[arg(short = 'c', long)]
   pub caps: String,
@@ -61,8 +53,8 @@ fn main() -> anyhow::Result<()> {
   let argv0_args: &[String] = &args.command[1..];
 
   let caps = args.caps;
-  let gid = args.gid.unwrap_or(getgid().into());
-  let uid = args.uid.unwrap_or(getuid().into());
+  let gid: u32 = getgid().as_raw();
+  let uid: u32 = getuid().as_raw();
 
   let mut fds = [0i32; 2];
   if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) == -1 } {
