@@ -37,15 +37,6 @@ pub fn allowed_uids() -> Vec<Uid> {
     .collect()
 }
 
-pub fn allowed_gids() -> Vec<Gid> {
-  ["wheel"]
-    .iter()
-    .filter_map(|name| {
-      Group::from_name(name).ok().flatten().map(|g| g.gid.as_raw())
-    })
-    .collect()
-}
-
 pub fn is_admitted(
   peer_uid: Uid,
   peer_groups: &[Gid]
