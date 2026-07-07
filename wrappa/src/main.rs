@@ -9,7 +9,17 @@ use {
       signal::{Signal, kill},
       wait::{WaitStatus, waitpid}
     },
-    unistd::{chdir, execve, getgid, getgroups, getuid, setgid, setuid}
+    unistd::{
+      chdir,
+      execve,
+      getgid,
+      getgroups,
+      getuid,
+      setegid,
+      seteuid,
+      setgid,
+      setuid
+    }
   },
   std::{
     ffi::CStr,
@@ -179,6 +189,19 @@ fn main() -> anyhow::Result<()> {
       exit(127);
     }
 
+    if wanted.contains(&Capability::CAP_SETGID) {
+      if let Err(e) = setegid(0.into()) {
+        eprintln!("setgid failed: {e}");
+        exit(127);
+      }
+    }
+    if wanted.contains(&Capability::CAP_SETUID) {
+      if let Err(e) = seteuid(0.into()) {
+        eprintln!("setuid failed: {e}");
+        exit(127);
+      }
+    }
+
     let path = wrappa_core::strtocstr(&argv0);
     let path = path.into_owned();
     let mut owned_args: Vec<std::ffi::CString> = Vec::new();
@@ -221,7 +244,8 @@ fn main() -> anyhow::Result<()> {
     child: child_pid.as_raw(),
     requested_gid: gid,
     requested_uid: uid,
-    requested_capabilities: caps
+    requested_capabilities: caps,
+    requested_binary: argv0.clone()
   };
 
   // Send request

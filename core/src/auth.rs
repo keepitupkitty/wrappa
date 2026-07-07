@@ -227,6 +227,12 @@ pub fn check_policy(
     }
   }
 
+  let bin = request.requested_binary.clone();
+
+  if !super::policy::is_binary_allowed(&bin) {
+    return Err(anyhow!("binary {bin} not permitted by policy"));
+  }
+
   Ok(())
 }
 

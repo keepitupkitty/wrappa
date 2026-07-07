@@ -13,7 +13,8 @@ pub struct WrappaRequest {
   pub child: super::Pid,
   pub requested_gid: super::Gid,
   pub requested_uid: super::Uid,
-  pub requested_capabilities: String
+  pub requested_capabilities: String,
+  pub requested_binary: String
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]

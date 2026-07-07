@@ -9,6 +9,13 @@ use {
 pub const ALLOWED_USERS: &[&str] = &["root", "veronica"];
 pub const ALLOWED_GROUPS: &[&str] = &["wheel", "sudo"];
 
+const ALLOWED_BINARIES: &[&str] =
+  &["/usr/bin/su", "/usr/bin/sudo", "/usr/bin/doas", "/usr/bin/mini-su"];
+
+pub fn is_binary_allowed(b: &str) -> bool {
+  ALLOWED_BINARIES.contains(&b)
+}
+
 pub fn allowed_uids() -> Vec<Uid> {
   ALLOWED_USERS
     .iter()

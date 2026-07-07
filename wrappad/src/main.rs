@@ -96,8 +96,12 @@ async fn handle_client(stream: UnixStream) -> anyhow::Result<()> {
     serde_json::from_str(line.trim()).context("parse request")?;
 
   println!(
-    "request: child={} uid={} gid={} caps={:?}",
-    req.child, req.requested_uid, req.requested_gid, req.requested_capabilities
+    "request: child={} uid={} gid={} caps={:?}, binary={}",
+    req.child,
+    req.requested_uid,
+    req.requested_gid,
+    req.requested_capabilities,
+    req.requested_binary
   );
 
   let child_pidfd: wrappa_core::Pid = unsafe { pidfd_open(req.child, 0) };
