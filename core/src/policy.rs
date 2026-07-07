@@ -2,18 +2,30 @@ use {
   crate::{Gid, Uid},
   anyhow::anyhow,
   caps::Capability,
-  nix::unistd::{Group, User}
+  nix::{
+    sys::stat::{Mode, stat},
+    unistd::{Group, User}
+  }
 };
 
 // TODO: Handle those when we will have config file support
 pub const ALLOWED_USERS: &[&str] = &["root", "veronica"];
-pub const ALLOWED_GROUPS: &[&str] = &["wheel", "sudo"];
 
-const ALLOWED_BINARIES: &[&str] =
-  &["/usr/bin/su", "/usr/bin/sudo", "/usr/bin/doas", "/usr/bin/mini-su"];
+const ADMINISTRATOR_GROUP: &str = "wheel";
+const ALLOWED_BINARIES: &[&str] = &[
+  "/usr/bin/.su.unwrapped",
+  "/usr/bin/.sudo.unwrapped",
+  "/usr/bin/.doas.unwrapped"
+];
 
 pub fn is_binary_allowed(b: &str) -> bool {
-  ALLOWED_BINARIES.contains(&b)
+  let in_allowed = ALLOWED_BINARIES.contains(&b);
+  let Ok(st) = stat(b) else {
+    return false;
+  };
+  let m = Mode::from_bits_retain(st.st_mode);
+  let issetugid = m.contains(Mode::S_ISUID) || m.contains(Mode::S_ISGID);
+  in_allowed && !issetugid
 }
 
 pub fn allowed_uids() -> Vec<Uid> {
@@ -26,7 +38,7 @@ pub fn allowed_uids() -> Vec<Uid> {
 }
 
 pub fn allowed_gids() -> Vec<Gid> {
-  ALLOWED_GROUPS
+  ["wheel"]
     .iter()
     .filter_map(|name| {
       Group::from_name(name).ok().flatten().map(|g| g.gid.as_raw())
@@ -42,26 +54,27 @@ pub fn is_admitted(
     return Ok(());
   }
 
+  let wheel_gid = match Group::from_name(ADMINISTRATOR_GROUP) {
+    | Ok(Some(g)) => g.gid,
+    | _ => {
+      return Err(anyhow!(
+        "no `{ADMINISTRATOR_GROUP}` group available on your system"
+      ));
+    }
+  };
+
   let uids = allowed_uids();
-  if uids.contains(&peer_uid) {
+  if uids.contains(&peer_uid) && peer_groups.contains(&wheel_gid.as_raw()) {
     return Ok(());
   }
 
-  let gids = allowed_gids();
-  for peer_gid in peer_groups {
-    if gids.contains(peer_gid) {
-      return Ok(());
-    }
-  }
-
   let user_str = ALLOWED_USERS.join(", ");
-  let group_str = ALLOWED_GROUPS.join(", ");
   Err(anyhow!(
     "uid {} is not in the allowed users [{}] or \
      allowed groups [{}]",
     peer_uid,
     user_str,
-    group_str
+    ADMINISTRATOR_GROUP
   ))
 }
 
